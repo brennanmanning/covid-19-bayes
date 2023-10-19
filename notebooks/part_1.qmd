@@ -1,0 +1,458 @@
+---
+title: Covid-19 Bayesian Modelling Part I
+format: html
+---
+
+This follows along a PyMCCon 2020 presentation of using PyMC3 to model the time series of new
+Covid-19 infections. This is an introduction to some basic ideas in Bayesian Modelling. I will be 
+translating the PyMC and python code into R code. The original python notebook can be found here:
+[Section4_1-Bayesian_Workflow.ipynb](https://gist.github.com/twiecki/43def0aa16ee6a23f822a124eb429958)
+
+```{r}
+#| output: false
+library(tidyverse)
+library(rstan)
+library(tidybayes)
+```
+
+```{r}
+#| output: false 
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+The data for Global cases is in the data folder in the base of this project. We will have to modify
+this to get into a slightly more tidy format. What we will need to do is this:
+
+1. Convert messy column names to be a bit friendlier (province/state -> province_state)
+2. Currently, the dates are on the columns which we would prefer that wasn't the case. We would like
+the date to be its own variable for this to be tidy
+4. We need to convert the dates to actually be dates
+
+```{r}
+global <- read_csv("../data/time_series_covid19_confirmed_global.csv") |>
+  janitor::clean_names() |>
+  pivot_longer(
+    cols = starts_with("x"),
+    names_to = "date",
+    values_to = "cases"
+  ) |>
+  mutate(
+    date = mdy(str_remove(date, "x"))
+  ) |>
+  select(!c(lat, long))
+```
+
+```{r}
+global |>
+  filter(country_region == "Netherlands") |>
+  ggplot(mapping = aes(x = date, y = cases)) +
+  geom_line()
+```
+
+
+There is a decent amount of noise in reporting before around 100 cases. This is a bit of a
+heuristic, but it's likely in the early stages of the disease, tests weren't widely spread and the 
+disease wasn't prone to large case clusters yet. Once 100 cases have arisen, the country likely
+has gained sufficient testing for the cases to be less noisy and likely the spread would start to
+pick up (both for increased testing and actual increase in spread).
+```{r}
+lcases <- global |>
+  arrange(country_region, date) |>
+  group_by(country_region) |>
+  filter(cases > 100) |>
+  ungroup()
+```
+
+Below, we will visualize one country's total case trajector up through July 2020 (height of the 
+pandemic), and a "trick" that was mentioned early on was to check the log of the cases to see if
+the cases have levelled off.
+```{r}
+lcases |>
+  filter(
+    country_region == "Germany",
+    date < ymd('2020-04-01')
+  ) |>
+  ggplot(
+    mapping = aes(x = date, y = cases)
+  ) +
+    geom_line()
+```
+
+```{r}
+lcases |>
+  filter(
+    country_region == "Germany",
+    date < ymd('2020-04-01')
+  ) |>
+  ggplot(
+    mapping = aes(x = date, y = cases)
+  ) +
+    geom_line() +
+    scale_y_continuous(trans = 'log10')
+```
+
+```{r}
+start_dates <- lcases |>
+  group_by(country_region) |>
+  summarize(start = min(date))
+
+lcases <- lcases |>
+  left_join(start_dates) |>
+  mutate(
+    t = (start %--% date) / days(1)
+  ) |>
+  select(!start)
+```
+
+## Dummy Model
+
+At first inspection, the total cases over the first 30-40 days of the pandemic in Germany looks
+like it follows exponential growth. So, a basic model that could work for this might be:
+\begin{gather*}
+c = \mathcal{N}(\mu(t), \sigma)\\
+\mu(t) = a (1 + b)^t\\
+a \sim \mathcal{N}(0, 1)\\
+b \sim \mathcal{N}(0, 0.5)\\
+\sigma \sim |\mathcal{N}(0, 1)|
+\end{gather*}
+
+This is the Stan code that represents this model.
+```{.stan filename="exp_model.stan"}
+data {
+    int<lower=0> N;
+    vector[N] t;
+    vector[N] cases;
+}
+
+parameters {
+    real a;
+    real b;
+    real<lower=0> sigma;
+}
+
+model {
+    a ~ normal(0, 1);
+    b ~ normal(0.3, 0.5);
+    sigma ~ normal(0, 1);
+    cases ~ normal(a * pow(1 + b, t), sigma);
+}
+
+````
+
+A base example will be tested on German data up until April of 2020.
+```{r}
+german_data <- lcases |>
+  filter(
+    country_region == "Germany",
+    date < ymd('2020-04-01')
+  ) |>
+  select(t, cases) |>
+  compose_data(.n_name = n_prefix("N"))
+```
+
+Before we actually start to fit the model to the real data, it is worthwhile to check the priors to
+make sure they make sense. An easy and likely best way to do this is to do a prior-predictive check,
+so draw samples from the priors of the parameters to check the output. We need to create a separate
+Stan file to achieve this.
+```{.stan filename="exp_model_prior.stan"}
+data {
+  int<lower=0> N;
+  vector[N] t;
+}
+
+generated quantities {
+  real a = normal_rng(0, 100);
+  real b = normal_rng(0.3, 0.3);
+  real sigma = fabs(normal_rng(0, 100));
+  array[N] real cases_sim = normal_rng(a * pow(1 + b, t), sigma);
+}
+
+```
+
+We'll test our model using a month's worth of data.
+```{r}
+t_test <- seq(1, 30)
+data <- list(N = length(t_test), t = t_test)
+exp_prior_m <- stan_model("exp_model_prior.stan", model_name = "exp_prior")
+exp_prior <- sampling(exp_prior_m, data = data, chains = 1, algorithm = "Fixed_param")
+```
+
+Below, we plot all potential trajectories as points on a graph. 
+```{r}
+exp_prior |>
+  spread_draws(cases_sim[t]) |>
+  filter(t < 11) |>
+  ggplot(mapping = aes(x = t, y = cases_sim)) +
+  geom_line(aes(group = .iteration), alpha = 0.1) +
+  ylim(-1000, 1000)
+```
+2 things become apparent and show flaws of the dummy model: 
+
+* We can get negative predictions as well 
+* Predictions can go up and down
+
+Something that isn't totally apparent here (since the y scale is limited to [-1000, 1000]) is that 
+predictions can go absurdly high in 10 days up to 10^5. This can be somewhat be seen by the warning.
+
+Nevertheless, we will try to fit the model and see what it spits out, knowing that we will try to
+improve the model.
+
+```{r}
+exp_post_m <- stan_model("exp_model.stan", model_name = "exp")
+exp_post <- sampling(exp_post_m, data = german_data)
+```
+We get a lot of warnings out of this, a likely sign that our model is bad or we messed up. Let's 
+inspect the pairs plot to see if anything is obviously wrong.
+
+```{r}
+traceplot(exp_post)
+```
+## Negative-Binomial Model
+
+Some problems with the dummy model:
+
+* Cases are allowed to be negative
+* New, daily cases can be negative 
+* Data has that cases starts at 100 (dummy model had a prior that put mean starting point at 0)
+
+A way to fix these issues is to change the distribution of the cases to negative binomial. The model
+now will only spit out positive values. However, monotonicity hasn't been covered yet. The build-up
+of the mean is the same, however there are some changes to the model. One big change will be that 
+the prior for $a$ will be centered around 100, so the starting point should be close to 11. There
+is also a new hyperparameter $\alpha$ that will describe the dispersion of the outcome.
+The full model is then:
+\begin{gather*}
+c = \mathrm{NegBin}(\mu(t), \alpha)\\
+\mu(t) = a (1 + b)^t\\
+a \sim \mathcal{N}(100, )\\
+b \sim \mathcal{N}(0.3, 0.5)\\
+\alpha \sim |\mathcal{N}(0, 1)|
+\end{gather*}
+
+Here's the stan code of the model.
+```{.stan filename="negbin_model.stan"}
+data {
+  int<lower=0> N;
+  vector[N] t;
+  int<lower=0> cases[N];
+}
+
+parameters {
+  real<lower=0> a;
+  real b;
+  real<lower=0> alpha;
+}
+
+transformed parameters {
+  vector<lower=0>[N] mu = a * pow(1 + b, t);
+}
+
+model {
+  a ~ exponential(0.01);
+  b ~ normal(0.3, 0.1);
+  alpha ~ gamma(6, 1);
+  cases ~ neg_binomial_2(mu, alpha);
+}
+
+generated quantities {
+  int<lower=0> case_sims[N] = neg_binomial_2_rng(mu, alpha);
+}
+
+```
+
+Again, we want to do a prior predictive check, so we need to write new stan code to do our prior
+predictive checks.
+
+```{.stan filename="negbin_prior.stan"}
+data {
+  int<lower=0> N;
+  vector[N] t;
+}
+
+generated quantities {
+  real a = exponential_rng(0.01);
+  real b = normal_rng(0.3, 0.1);
+  real alpha = gamma_rng(6, 1);
+  array[N] real cases_sim = neg_binomial_2_rng(a * (1 + b)^ t, alpha);
+}
+
+```
+
+```{r}
+nb_prior_m <- stan_model("negbin_prior.stan", model_name = "nb_prior")
+nb_prior <- sampling(nb_prior_m, data = data, chains = 1, algorithm = "Fixed_param")
+```
+
+```{r}
+nb_prior |>
+  spread_draws(cases_sim[t]) |>
+  filter(t < 11) |>
+  ggplot(mapping = aes(x = t, y = cases_sim)) +
+  geom_line(aes(group = .iteration), alpha = 0.01) 
+```
+
+We can start to see the benefits fo the new model. There are no negative cases and we more clearly
+see a reliable exponential pattern. So, we can trust a bit more that we can get a good fit on our
+actual data
+
+```{r}
+test_data <- lcases |>
+  filter(
+    country_region == "Germany",
+    date < ymd('2020-04-01')
+  ) |>
+  select(t, cases) |>
+  head(10) |>
+  compose_data(.n_name = n_prefix("N"))
+```
+
+
+```{r}
+nb_post_m <- stan_model("negbin_model.stan", model_name = "nb")
+nb_post <- sampling(nb_post_m, data = test_data, chains = 4)
+```
+
+### Issues with Sampling 
+I have tried very hard to get this to sample multiple times on the full data set (i.e. using 
+`german_data`, so not limiting to 10 cases). But the samples would fail for various reasons. A 
+parameter would get set to 0. A simulation would overflow. 2 chains would succeed and 2 would fail.
+Trying to debug this is hard. It seemed like 50/50 if a single chain would have an error or not. 
+The main error here seemed to be overflow. There would be simulations of values above 1e^9 (a limit
+imposed by Stan) which are unrealistic for real world data, but for an exponential model not so 
+much. 
+
+This is just one issue with trying to model a non-stationary time series. If you were to instead try
+to build a model with the amount of new cases, you would not deal with most of these issues. You
+would get monotonicity for free of the cumulative cases and overflow likely wouldn't be an issue
+
+However, that will come in later parts of the notebook and series. I will continue to use the 10 
+days, as that is all the notebook in the video shows and I suspect that it is for the reasons I 
+have dealt with.
+
+### Anyways...
+
+```{r}
+traceplot(nb_post, pars = c("a", "b"))
+```
+
+```{r}
+plot(nb_post, plotfun = "hist", pars = c("a", "b"))
+```
+
+```{r}
+nb_draws <- nb_post |> spread_draws(case_sims[t])
+gd <-  lcases |>
+  filter(
+    country_region == "Germany",
+    t < 11
+  ) |>
+  select(t, cases) 
+nb_draws |>
+  group_by(t) |>
+  summarize(
+    ql = quantile(case_sims, 0.055),
+    qh = quantile(case_sims, 0.945),
+    mu = mean(case_sims)
+  ) |>
+  left_join(gd) |>
+  ggplot(aes(x = t)) + 
+  geom_ribbon(aes(ymin = ql, ymax = qh, color = "89% PI"), fill = "grey70") +
+  geom_line(aes(y = mu, color = "Mean")) + 
+  geom_line(aes(y = cases, color = "Real")) +
+  scale_color_manual(
+    name = "Posterior Predictive",
+    breaks = c("89% PI", "Mean", "Real"),
+    values = c("89% PI" = "grey70", "Mean" = "black", "Real" = "red"))
+```
+
+From here, we can see that the realized data is within our 89% Predictive Interval (89% is a nod
+to Richard McElreath who wrote Statistical Rethinking who opts to not use any 95% intervals). 
+
+Where I will differentiate from what Tyler Wiecki did in his video is I will not do the forecasting
+for this part of the model. I struggled to sample past 10 days, and this issue likely will persist 
+when forecasting for 11-60 days, even though there is no effect on samples.
+
+## Logistic Regression Model
+
+This is **not** the classical logistic regression model where you might be trying to classify an 
+observation to a number of classes but using a more general logistic function. This is makes more
+sense when you inspect the data past a certain point, as the cases start to plateau as growth slows.
+This is like the classical ecology use case of the model where you are modelling population growth.
+
+The logistic function used here is:
+$$f(x) = \frac{L}{1 + \exp\{-k(t)}$$
+This will be used in place of the exponential function or the mean argument passed to the negative
+binomial function.
+
+```{r}
+t_test <- seq(1, 90)
+data <- list(N = length(t_test), t = t_test)
+lr_prior_m <- stan_model("lr_prior.stan", model_name = "lr_prior")
+lr_prior <- sampling(lr_prior_m, data = data, chains = 1, algorithm = "Fixed_param")
+```
+
+```{r}
+lr_prior |>
+  spread_draws(case_sims[t]) |>
+  ggplot(mapping = aes(x = t, y = case_sims)) +
+  geom_line(aes(group = .iteration), alpha = 0.1) +
+  scale_y_continuous(trans = "log10")
+```
+
+Our model now looks like it properly has an upper bound on it, so we can start sampling our real model.
+
+```{r}
+g_data <- lcases |>
+  filter(
+    country_region == "Germany",
+    t < 91
+  ) |>
+  select(t, cases) |>
+  compose_data(.n_name = n_prefix("N"))
+```
+
+```{r}
+lr_post_m <- stan_model("lr_model.stan", model_name = "lr")
+lr_post <- sampling(lr_post_m, data = g_data, chains = 4)
+```
+
+```{r}
+traceplot(lr_post, pars = c("a", "b", "cc", "alpha"))
+```
+
+```{r}
+plot(lr_post, plotfun = "hist", pars = c("a", "b", "cc", "alpha"))
+```
+
+```{r}
+lr_draws <- lr_post |> spread_draws(case_sims[t])
+gd <-  lcases |>
+  filter(
+    country_region == "Germany",
+    t < 91
+  ) |>
+  select(t, cases) 
+lr_draws |>
+  group_by(t) |>
+  summarize(
+    ql = quantile(case_sims, 0.055),
+    qh = quantile(case_sims, 0.945),
+    mu = mean(case_sims)
+  ) |>
+  left_join(gd) |>
+  ggplot(aes(x = t)) + 
+  geom_ribbon(aes(ymin = ql, ymax = qh, color = "89% PI"), fill = "grey70") +
+  geom_line(aes(y = mu, color = "Mean")) + 
+  geom_line(aes(y = cases, color = "Real")) +
+  scale_color_manual(
+    name = "Posterior Predictive",
+    breaks = c("89% PI", "Mean", "Real"),
+    values = c("89% PI" = "grey70", "Mean" = "black", "Real" = "red"))
+```
+
+For German data, our model does pretty well for the first 90 days. However, in the video he does
+show that this model will fail for other countries like the US where the growth didn't stop and the
+disease continued. This largely is due to the methodology used and likely the data subset used here.
+Instead focusing on the daily cases can also be a help to modelling.
+

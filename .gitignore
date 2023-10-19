@@ -1,0 +1,12 @@
+renv/library/
+renv/staging/
+renv/.gitignore
+notebooks/*.rds
+notebooks/*_cache/
+notebooks/*_files/
+notebooks/*.html
+.DS_Store
+.RData
+.Rhistory
+.RProfile
+

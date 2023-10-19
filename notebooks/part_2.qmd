@@ -1,0 +1,243 @@
+---
+title: Covid-19 Bayesian Modelling Part II
+format: html
+execute:
+  cache: true
+---
+
+This is a continuation of part I of convertin some ideas from a PyMC videos into close to equivalent
+R code. The idea now will be to use actual domain expertise now to build
+out these models. The notebook containing the should be equivalent Python Code is here 
+[Section 4_2-Generative_Modeling.ipynb](https://gist.github.com/twiecki/fc63488e7c81d162af3f58ae68a32cd4)
+
+
+Here are the libraries we will be using. 
+```{r}
+#| output: false
+library(tidyverse)
+library(rstan)
+library(tidybayes)
+library(patchwork)
+library(bayesplot)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+Here is the code to get the data out. 
+```{r}
+global <- read_csv("../data/time_series_covid19_confirmed_global.csv") |>
+  janitor::clean_names() |>
+  pivot_longer(
+    cols = starts_with("x"),
+    names_to = "date",
+    values_to = "cases"
+  ) |>
+  mutate(
+    date = mdy(str_remove(date, "x"))
+  ) |>
+  select(!c(lat, long))
+
+cases <- global |>
+  arrange(country_region, date) |>
+  filter(cases > 100)
+
+start_dates <- cases |>
+  group_by(country_region) |>
+  summarize(start = min(date))
+
+cases <- cases |>
+  left_join(start_dates) |>
+  mutate(
+    t = (start %--% date) / days(1)
+  ) |>
+  select(!start)
+```
+
+Now, one of the problems experienced last time was that we were modelling the cumulative cases. To
+rectify this, we need to add on new cases. 
+```{r}
+dcases <- cases |>
+  group_by(country_region) |>
+  mutate(daily_cases = cases - lag(cases)) |>
+  ungroup() |>
+  filter(!is.na(daily_cases))
+```
+
+## Introducing Time-Varying Reproduction
+
+The modelling gets away from using a "reduced-form" model (i.e. not using applied knowledge to build
+model, but trying to match structure). The starting point here is instead an epidemiological measure
+the $R_0$, the reproductive factor, of the disease. This describes how many other people an infected
+person might pass the disease on to. But this is idealistic and ignores any counter-measure we might
+use on it. A bettter number to track is the effective reproduction factor on day $t$, $R_e(t)$. 
+
+We skip the initial model that just builds a model for $R_0$ to get out the daily case count, as 
+this is deeply flawed and not of much value for learning. Instead we skip to where we will actually
+start modelling the effective rate of reproduction.
+
+Here's the model in Stan:
+```{.stan filename="base_rt.stan"}
+data {
+  int<lower=0> N;
+  array[N] int<lower=0> cases;
+}
+
+parameters {
+  vector[N] logrt;
+  real<lower=0> alpha;
+}
+
+transformed parameters {
+  vector[N] rt = exp(logrt);
+}
+
+model {
+  alpha ~ gamma(36, 6);
+  logrt[1] ~ normal(0, 0.035);
+  for (n in 2:N) {
+    logrt[n] ~ normal(logrt[n-1], 0.035);  
+  }
+  for (n in 2:N) {
+    cases[n] ~ neg_binomial_2(rt[n] * cases[n-1] + 0.01, alpha);
+  }
+}
+
+generated quantities {
+  array[N] int<lower=0> cases_sim;
+  int large = 10000000;
+  cases_sim[1] = cases[1];
+  for (n in 2:N) {
+    cases_sim[n] = neg_binomial_2_rng(rt[n] * cases_sim[n-1] + 0.01, alpha);
+    cases_sim[n] = cases_sim[n] > large ? large : cases_sim[n];
+  }
+}
+
+```
+The 0.01 in the negative_binomial is to prevent simulations from having 0 mean as that causes a 
+large number of exceptions.
+
+Here's the prior simulations in Stan:
+```{.stan filename="base_rt_prior.stan"}
+data {
+  int<lower=0> N;
+}
+
+generated quantities {
+  real alpha = gamma_rng(36, 6);
+  vector[N] logrt;
+  logrt[1] = normal_rng(0, 0.035);
+  for (n in 2:N){
+    logrt[n] = normal_rng(logrt[n-1], 0.035);
+  }
+  vector[N] rt = exp(logrt);
+  array[N] int cases_sim;
+  cases_sim[1] = 1;
+  for (n in 2:N) {
+    cases_sim[n] = neg_binomial_2_rng(rt[n] * cases_sim[n-1] + 0.01, alpha);
+  }
+}
+
+```
+
+Now, we'll get the prior-predictive sampline done:
+```{r}
+#| output: false
+p_data <- list(N = 200)
+rt_prior_m <- stan_model("base_rt_prior.stan", model_name = "rt_prior")
+rt_prior <- sampling(rt_prior_m, data = p_data, chains = 1, algorithm = "Fixed_param", warmup = 0)
+```
+
+```{r}
+rt_prior_draws <- rt_prior |>
+  spread_draws(cases_sim[t], rt[t]) |>
+  drop_na()
+rp1 <- rt_prior_draws |>
+  ggplot(aes(x = t, y = cases_sim)) +
+  geom_line(aes(group = .iteration), alpha = 0.1) +
+  scale_y_continuous(trans = "log10")
+rp2 <- rt_prior_draws |>
+  ggplot(aes(x = t, y = rt)) + 
+  geom_line(aes(group = .iteration), alpha = 0.05)
+rp1 + rp2
+```
+We can see we can get some extremely large values here, so it  might be worth tuning some of the
+parameters a bit more. But for now, we will at least see if we can get our posterior sampling to 
+work.
+
+```{r}
+us_list <- dcases |>
+  filter(
+    country_region == "US",
+    date < ymd("2020-08-01")
+  ) |>
+  select(cases = daily_cases) |>
+  compose_data(.n_name = n_prefix("N"))
+```
+
+```{r}
+#| output: false
+rt_post_m <- stan_model("base_rt.stan", model_name = "rt_post")
+rt_post <- sampling(rt_post_m, data = us_list)
+```
+
+```{r}
+mcmc_nuts_energy(nuts_params(rt_post), merge_chains = TRUE)
+```
+
+Our energy plot looks fine. Let's check the posteriors next, then.
+
+```{r}
+rt_post_draws <- rt_post |>
+  spread_draws(cases_sim[t], rt[t]) |>
+  drop_na() 
+
+us_plot_data <- dcases |>
+  filter(
+    country_region == "US",
+    date < ymd("2020-09-01")
+  ) |>
+  select(t, daily_cases)
+
+rt_post_summ <- rt_post_draws |>
+  group_by(t) |>
+  summarize(
+    qlr = quantile(rt, 0.055),
+    qhr = quantile(rt, 0.945),
+    qlc = quantile(cases_sim, 0.055),
+    qhc = quantile(cases_sim, 0.945),
+    mur = mean(rt),
+    muc = mean(cases_sim)
+  ) |>
+  left_join(us_plot_data)
+
+p1 <- rt_post_summ |>
+  ggplot(aes(x = t)) +
+  geom_ribbon(aes(ymin = qlc, ymax = qhc, color = "89% PI"), fill = "grey70") + 
+  geom_line(aes(y = daily_cases, color = "Real")) +
+  scale_color_manual(
+    name = "Posterior Predictive",
+    breaks = c("89% PI", "Real"),
+    values = c("89% PI" = "grey70", "Real" = "red"))
+
+p2 <- rt_post_summ |>
+  ggplot(aes(x = t)) +
+  geom_ribbon(aes(ymin = qlr, ymax = qhr, color = "89% PI"), fill = "grey70", alpha = 0.5) + 
+  geom_line(aes(y = mur, color = "Mean")) + 
+  scale_color_manual(
+    name = "Posterior Predictive",
+    breaks = c("89% PI", "Mean"),
+    values = c("89% PI" = "grey70", "Mean" = "black"))
+
+p1 / p2
+```
+
+The daily case range seems reasonable and is comparable to what was shown in the video. However, the
+effective reproduction is much different from what was shown in the model. His estimate of $R_e(t)$
+converges to 0 fairly tightly. Instead, I am getting it to converge to 1. This could be a result
+of many different things: my data comes from 3 years later and there might have been data cleaning 
+in this period of time. Or, the weird Theano hacks they used gave some more bizarre results.
+
+## Adding in Time-Delay
+
+TODO
